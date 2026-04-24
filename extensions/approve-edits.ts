@@ -1,3 +1,6 @@
+import { constants as fsConstants, promises as fs } from "node:fs";
+import path from "node:path";
+
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { isToolCallEventType } from "@mariozechner/pi-coding-agent";
 import { matchesKey } from "@mariozechner/pi-tui";
@@ -11,6 +14,11 @@ type ApprovalContext = ExtensionContext;
 type ApprovalRequest = {
 	filePath: string;
 	operationLabel: string;
+};
+
+type FileEdit = {
+	oldText: string;
+	newText: string;
 };
 
 export default function (pi: ExtensionAPI) {
@@ -51,6 +59,9 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasUI || !approvalEnabled) return undefined;
 
 		if (isToolCallEventType("write", event)) {
+			const shouldPrompt = await shouldPromptForWrite(ctx, event.input.path, event.input.content);
+			if (!shouldPrompt) return undefined;
+
 			const approved = await requestApproval(ctx, {
 				filePath: event.input.path,
 				operationLabel: "write",
@@ -62,6 +73,9 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (isToolCallEventType("edit", event)) {
+			const shouldPrompt = await shouldPromptForEdit(ctx, event.input.path, event.input.edits);
+			if (!shouldPrompt) return undefined;
+
 			const approved = await requestApproval(ctx, {
 				filePath: event.input.path,
 				operationLabel: "edit",
@@ -123,6 +137,80 @@ function toggleApproval(ctx: ApprovalContext, toggle: () => boolean): void {
 	ctx.ui.notify(enabled ? "Edit approval enabled" : "Edit approval disabled (auto-approve)", "info");
 }
 
+async function shouldPromptForWrite(ctx: ApprovalContext, filePath: string, content: string): Promise<boolean> {
+	const resolvedPath = resolveToolPath(ctx, filePath);
+	const fileState = await getPathState(resolvedPath);
+	if (fileState === "directory" || fileState === "missing-parent") {
+		return false;
+	}
+
+	if (fileState === "file") {
+		if (!(await isWritable(resolvedPath))) {
+			return false;
+		}
+
+		try {
+			const existingContent = await fs.readFile(resolvedPath, "utf8");
+			if (existingContent === content) {
+				return false;
+			}
+		} catch {
+			return false;
+		}
+	}
+
+	const writableTarget = fileState === "file" ? resolvedPath : await findNearestExistingParent(path.dirname(resolvedPath));
+	return writableTarget !== undefined && (await isWritable(writableTarget));
+}
+
+async function shouldPromptForEdit(ctx: ApprovalContext, filePath: string, edits: FileEdit[]): Promise<boolean> {
+	const resolvedPath = resolveToolPath(ctx, filePath);
+	if ((await getPathState(resolvedPath)) !== "file") {
+		return false;
+	}
+
+	if (!(await isWritable(resolvedPath))) {
+		return false;
+	}
+
+	let fileContent: string;
+	try {
+		fileContent = await fs.readFile(resolvedPath, "utf8");
+		// Preflighting predictable filesystem and match failures keeps approval
+		// prompts for changes that the built-in edit tool can actually apply.
+	} catch {
+		return false;
+	}
+
+	const matchRanges: Array<{ start: number; end: number }> = [];
+	let hasMeaningfulChange = false;
+
+	for (const edit of edits) {
+		if (edit.oldText.length === 0) {
+			return false;
+		}
+
+		const matchStart = findUniqueMatchStart(fileContent, edit.oldText);
+		if (matchStart === undefined) {
+			return false;
+		}
+
+		matchRanges.push({ start: matchStart, end: matchStart + edit.oldText.length });
+		if (edit.oldText !== edit.newText) {
+			hasMeaningfulChange = true;
+		}
+	}
+
+	matchRanges.sort((a, b) => a.start - b.start);
+	for (let i = 1; i < matchRanges.length; i++) {
+		if (matchRanges[i - 1]!.end > matchRanges[i]!.start) {
+			return false;
+		}
+	}
+
+	return hasMeaningfulChange;
+}
+
 function clearApprovalUi(ctx: ApprovalContext): void {
 	ctx.ui.setWidget(APPROVAL_WIDGET_KEY, undefined);
 }
@@ -130,8 +218,8 @@ function clearApprovalUi(ctx: ApprovalContext): void {
 function updateApprovalStatus(ctx: ApprovalContext, approvalEnabled: boolean): void {
 	const theme = ctx.ui.theme;
 	const status = approvalEnabled
-		? theme.fg("success", "auto-edit: on") + theme.fg("dim", " [ctrl+q]")
-		: theme.fg("warning", "auto-edit: off") + theme.fg("dim", " [ctrl+q]");
+		? theme.fg("warning", "auto-edit: off") + theme.fg("dim", " [ctrl+q]")
+		: theme.fg("success", "auto-edit: on") + theme.fg("dim", " [ctrl+q]");
 	ctx.ui.setStatus(APPROVAL_STATUS_KEY, status);
 }
 
@@ -145,4 +233,54 @@ function readApprovalInput(data: string): boolean | undefined {
 	}
 
 	return undefined;
+}
+
+function resolveToolPath(ctx: ApprovalContext, filePath: string): string {
+	return path.isAbsolute(filePath) ? filePath : path.resolve(ctx.cwd, filePath);
+}
+
+async function getPathState(targetPath: string): Promise<"file" | "directory" | "missing" | "missing-parent"> {
+	try {
+		const stats = await fs.stat(targetPath);
+		return stats.isDirectory() ? "directory" : "file";
+	} catch {
+		const parentPath = await findNearestExistingParent(path.dirname(targetPath));
+		return parentPath === undefined ? "missing-parent" : "missing";
+	}
+}
+
+async function findNearestExistingParent(startPath: string): Promise<string | undefined> {
+	let currentPath = path.resolve(startPath);
+
+	while (true) {
+		try {
+			const stats = await fs.stat(currentPath);
+			return stats.isDirectory() ? currentPath : undefined;
+		} catch {
+			const parentPath = path.dirname(currentPath);
+			if (parentPath === currentPath) {
+				return undefined;
+			}
+			currentPath = parentPath;
+		}
+	}
+}
+
+async function isWritable(targetPath: string): Promise<boolean> {
+	try {
+		await fs.access(targetPath, fsConstants.W_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function findUniqueMatchStart(content: string, searchText: string): number | undefined {
+	const firstMatch = content.indexOf(searchText);
+	if (firstMatch === -1) {
+		return undefined;
+	}
+
+	const secondMatch = content.indexOf(searchText, firstMatch + 1);
+	return secondMatch === -1 ? firstMatch : undefined;
 }
