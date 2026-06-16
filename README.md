@@ -1,11 +1,12 @@
 # pi-harness-extras
 
-Personal pi package for custom extensions and skills.
+Personal pi package for custom extensions, skills, and prompt templates.
 
 ## Structure
 
 - `extensions/` — TypeScript pi extensions
 - `skills/` — Agent Skills / pi skills
+- `prompts/` — pi prompt templates
 
 ## Local development
 

@@ -1,6 +1,6 @@
 ---
 name: flutter-dev
-description: Instructions for working in a Flutter project. Covers running, building, testing and debugging the app on simulators/emulators/devices. Use when the task involves Flutter or Dart mobile development.
+description: Instructions for working in a Flutter project. Covers running, building, testing and debugging a Flutter app on simulators/emulators/devices. Use when the task involves Flutter or Dart mobile development.
 ---
 
 # Flutter Dev
